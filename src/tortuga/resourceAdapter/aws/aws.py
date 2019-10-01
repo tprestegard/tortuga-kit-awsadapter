@@ -1751,38 +1751,6 @@ fqdn: %s
             node.softwareprofile.name,
             primary_nic.ip)
 
-        # Assign instance tags
-        self._logger.debug(
-            'Assigning tags to instance [{0}]'.format(instance.id))
-
-        total_sleep = 0
-
-        while total_sleep < launch_request.configDict['createtimeout']:
-            try:
-                self.__assign_tags(
-                    launch_request.configDict, launch_request.conn, node,
-                    instance)
-
-                break
-            except boto.exception.EC2ResponseError as exc:
-                self._logger.debug(
-                    'Ignoring exception tagging instances: {0}'.format(
-                        str(exc)))
-
-            gevent.sleep(3)
-
-            total_sleep += 3
-
-        if total_sleep >= launch_request.configDict['createtimeout']:
-            raise AWSOperationTimeoutError(
-                'Timeout attempting to assign tags to instance {0}'.format(
-                    instance.id))
-
-        if total_sleep:
-            self._logger.debug(
-                'Waited %d seconds tagging instance %s' % (
-                    total_sleep, instance.id))
-
         # This node is ready
         node_request['status'] = 'running'
 
@@ -1790,16 +1758,12 @@ fqdn: %s
 
         self.fire_provisioned_event(node)
 
-    def __assign_tags(self, configDict: dict, conn: EC2Connection,
-                      node: Node, instance):
+    def __get_instance_specific_tags(self, configDict: Dict[str, Any],
+                                     node: Node) -> Dict[str]:
         """
-        Add tags to instance and attached EBS volumes
+        Generates a dict of tags to be applied to an EC2 instance.
         """
-
-        if not configDict.get('use_tags', None):
-            return
-
-        instance_specific_tags = {
+        tags = {
             'tortuga:softwareprofile':
                 node.softwareprofile.name,
             'tortuga:hardwareprofile':
@@ -1812,16 +1776,29 @@ fqdn: %s
                 self.installer_public_ipaddress,
         }
 
-        instance_specific_tags.update(configDict.get('tags', {}))
-
+        tags.update(configDict.get('tags', {}))
         if configDict['use_instance_hostname']:
             # Use default "Name" tag, if not defined in adapter
             # configuration
             if 'Name' not in configDict.get('tags', {}):
-                instance_specific_tags['Name'] = 'Tortuga compute node'
+                tags['Name'] = 'Tortuga compute node'
         else:
             # Fallback to default behaviour
-            instance_specific_tags['Name'] = node.name
+            tags['Name'] = node.name
+
+        return tags
+
+    def __assign_tags(self, configDict: dict, conn: EC2Connection,
+                      node: Node, instance):
+        """
+        Add tags to instance and attached EBS volumes
+        """
+
+        if not configDict.get('use_tags', None):
+            return
+
+        instance_specific_tags = \
+            self.__get_instance_specific_tags(configDict, node)
 
         self.__addTags(conn, [instance.id], instance_specific_tags)
 
@@ -2186,6 +2163,34 @@ fqdn: %s
         else:
             # Default instance (non-VPC)
             args['SecurityGroupIds'] = configDict.get('securitygroup', [])
+
+        # The remainder of this method sets up tags for the instance and the
+        # EBS volumes.  If we aren't using tags, then just return
+        if not configDict.get('use_tags', None):
+            return args
+
+        # Otherwise, set up the tags
+        # Get tags for instance
+        instance_specific_tags = \
+            self.__get_instance_specific_tags(configDict, node)
+
+        # Convert to "tag specification" - format expected by boto3
+        instance_tag_specs = {'ResourceType': 'instance'}
+        instance_tag_specs['Tags'] = \
+            [{'Key': k, 'Value': v} for k, v in instance_specific_tags.items()]
+
+        # Set up full tag specifications
+        full_tag_specs = [instance_tag_specs]
+
+        # Set up EBS volume tag specification
+        if 'tags' in configDict and configDict['tags']:
+            volume_tag_specs = {'ResourceType': 'volume'}
+            volume_tag_specs = \
+                [{'Key': k, 'Value': v} for k, v in configDict['tags']]
+            full_tag_specs.append(volume_tag_specs)
+
+        # Add full tag specification to args
+        args['TagSpecifications'] = full_tag_specs
 
         return args
 
